@@ -7,7 +7,7 @@ QuickJS library to add minimal browser environment, first used to run PouchDB
 Work in progress.
 
 | Javascript object | Polyfill in C | Implementation status | Unit test |
-------------------------------------------------------------------------------
+|---|---|---|---|
 | self | C function | ✅ | ❌ |
 | setTimeout | C function | ✅ | ❌ |
 | fetch | CivetWeb | ❌ | ❌ |
