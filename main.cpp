@@ -94,7 +94,7 @@ static int eval_buf(JSContext *ctx, const char *buf, int buf_len,
     JS_FreeValue(ctx, val);
     return ret;
 }
-/*
+
 #include <stdio.h>
 #include <string.h>
 
@@ -114,7 +114,7 @@ int has_suffix(const char *str, const char *suffix) {
     // Compare la fin de str avec suffix
     return strcmp(str + len_str - len_suffix, suffix) == 0;
 }
-*/
+
 
 static int eval_file(JSContext *ctx, const char *filename, int module)
 {
@@ -590,9 +590,121 @@ static int js_headers_init(JSContext *ctx) {
     return 0;
 }
 
-/* This sample is meant to demonstrate a very simple Javascript program that
-   calls our single C hook function.
-*/
+/* also used to initialize the worker context */
+static JSContext *JS_NewCustomContext(JSRuntime *rt)
+{
+    JSContext *ctx;
+    ctx = JS_NewContext(rt);
+    if (!ctx)
+        return NULL;
+#ifdef CONFIG_BIGNUM
+    if (bignum_ext) {
+        JS_AddIntrinsicBigFloat(ctx);
+        JS_AddIntrinsicBigDecimal(ctx);
+        JS_AddIntrinsicOperators(ctx);
+        JS_EnableBignumExt(ctx, TRUE);
+    }
+#endif
+    /* system modules */
+    js_init_module_std(ctx, "std");
+    js_init_module_os(ctx, "os");
+    return ctx;
+}
+
+// Fonction pour lire le contenu d'un fichier JavaScript
+char* read_file(const char* filename) {
+    FILE* file = fopen(filename, "r");
+    if (!file) {
+        perror("Cannot open file");
+        return NULL;
+    }
+    fseek(file, 0, SEEK_END);
+    long length = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    
+    char* content = static_cast<char*>(malloc(length + 1));
+    if (!content) {
+        perror("Memory allocation failed");
+        fclose(file);
+        return NULL;
+    }
+
+    fread(content, 1, length, file);
+    content[length] = '\0';
+    fclose(file);
+    return content;
+}
+
+// Simuler require() pour charger un module
+JSValue js_require(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (argc < 1) {
+        return JS_EXCEPTION;
+    }
+
+    const char *module_name = JS_ToCString(ctx, argv[0]);
+    if (!module_name) {
+        return JS_EXCEPTION;
+    }
+
+    // Ajouter l'extension .js pour le fichier
+    char file_name[256];
+    snprintf(file_name, sizeof(file_name), "%s.js", module_name);
+
+    // Lire le contenu du fichier
+    char* code = read_file(file_name);
+    if (!code) {
+        JS_FreeCString(ctx, module_name);
+        return JS_EXCEPTION;
+    }
+
+    // Créer l'environnement du module avec `module` et `exports`
+    const char* wrapper_prefix = "(function(require, module, exports) {";
+    const char* wrapper_suffix = "})";
+    size_t wrapped_code_len = strlen(wrapper_prefix) + strlen(code) + strlen(wrapper_suffix) + 1;
+    char* wrapped_code = static_cast<char*>(malloc(wrapped_code_len));
+
+    snprintf(wrapped_code, wrapped_code_len, "%s%s%s", wrapper_prefix, code, wrapper_suffix);
+    free(code);
+
+    // Créer les objets module et exports
+    JSValue module = JS_NewObject(ctx);
+    JSValue exports = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, module, "exports", exports);
+
+    // Compiler et exécuter le module JavaScript
+    JSValue result = JS_Eval(ctx, wrapped_code, strlen(wrapped_code), file_name, JS_EVAL_TYPE_GLOBAL);
+    free(wrapped_code);
+
+    if (JS_IsException(result)) {
+        JS_FreeValue(ctx, result);
+        JS_FreeCString(ctx, module_name);
+        return JS_EXCEPTION;
+    }
+
+    // Appeler le wrapper fonctionnel du module
+    JSValue args[3] = { JS_UNDEFINED, module, exports };
+    JSValue require_func = JS_NewCFunction(ctx, js_require, "require", 1);
+    args[0] = require_func;
+
+    JSValue func = JS_Call(ctx, result, JS_UNDEFINED, 3, args);
+    JS_FreeValue(ctx, result);
+    JS_FreeValue(ctx, require_func);
+
+    if (JS_IsException(func)) {
+        JS_FreeCString(ctx, module_name);
+        return JS_EXCEPTION;
+    }
+
+    JS_FreeValue(ctx, func);
+
+    // Retourner module.exports
+    JSValue module_exports = JS_GetPropertyStr(ctx, module, "exports");
+    JS_FreeValue(ctx, module);
+    JS_FreeCString(ctx, module_name);
+    return module_exports;
+}
+
+
 int main(int argc, const char* argv[]) {
     JSRuntime* jsrt;
     JSContext* jsctx;
@@ -600,20 +712,25 @@ int main(int argc, const char* argv[]) {
     JSMemoryUsage stats;
     JSValue result;
     const char* script =
-        "import PouchDB from '../pouchdb-9.0.0.js';\n" 
-        "var x = Math.PI;\n"
+        "import * as pdb from './pouchdb-9.0.0.js';\n" 
         "console.log('Hello');\n"      
-        "console.log('x = ', x);\n"
-        "var y = Math.sin(x * 0.5);\n"
-        "console.log('SIN(x/2) = ', y);\n";
+    ;
 
+     jsrt = JS_NewRuntime();
+    js_std_set_worker_new_context_func(JS_NewCustomContext);
+    js_std_init_handlers(jsrt);
+    jsctx = JS_NewCustomContext(jsrt);
 
-    jsrt = JS_NewRuntime();
-    jsctx = JS_NewContext(jsrt);
+   
+    // jsctx = JS_NewContext(jsrt);
     if (!jsctx) {
         fprintf(stderr, "Failed to create a new JS context\n");
         return 1;
     }
+
+     /* loader for ES6 modules */
+    JS_SetModuleLoaderFunc(jsrt, NULL, js_module_loader, NULL);
+
 
     init_c_hooks(jsctx);
     
@@ -625,30 +742,16 @@ int main(int argc, const char* argv[]) {
 
     js_headers_init(jsctx);
 
-    // result = JS_Eval(jsctx, script, strlen(script), "<input>", 0);
+     JSValue global_obj = JS_GetGlobalObject(jsctx);
+    JS_SetPropertyStr(jsctx, global_obj, "require", JS_NewCFunction(jsctx, js_require, "require", 1));
+    JS_FreeValue(jsctx, global_obj);
 
-    int res = eval_file(jsctx, "../pouchdb-9.0.0.js", 0);
-    if (JS_IsException(result)) {
-        JSValue exception = JS_GetException(jsctx);
-        JS_BOOL is_error = JS_IsError(jsctx, exception);
-        dump_value_to_stream(jsctx, stderr, exception);
-        if (is_error) {
-            JSValue stack = JS_GetPropertyStr(jsctx, exception, "stack");
-            if (!JS_IsUndefined(stack)) {
-                dump_value_to_stream(jsctx, stderr, stack);
-            }
-            JS_FreeValue(jsctx, stack);
-        }
-        
-        JS_FreeValue(jsctx, exception);
-    }
-
-    JS_FreeValue(jsctx, result);
-
+    int res = eval_file(jsctx, argv[1], 1);
     
    // JS_ComputeMemoryUsage(jsrt, &stats);
    // JS_DumpMemoryUsage(stdout, &stats, jsrt);
 
+    js_std_free_handlers(jsrt);
     JS_FreeContext(jsctx);
     JS_FreeRuntime(jsrt);
 
